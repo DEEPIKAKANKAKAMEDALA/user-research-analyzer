@@ -1,20 +1,23 @@
-# app.py — Upload (CSV/Excel) → Clean → Embed → Auto-K KMeans → Summarize with Gemini → Dashboard
 import os, json, re, string
 import pandas as pd, numpy as np, streamlit as st, plotly.express as px
+
 import nltk
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
-from fastembed import TextEmbedding
+
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
+from sklearn.preprocessing import normalize
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.metrics import silhouette_score
+
 import google.generativeai as genai
 
 st.set_page_config(page_title="AI User Research Analyzer", layout="wide")
 st.title("AI-Powered User Research Analyzer")
-st.caption("Upload a CSV or Excel with a text column (survey answers or reviews). Optional: source, user_segment, created_at.")
+st.caption("Upload a CSV or Excel with a text column (survey answers or reviews). Optional: source, user_segment.")
 
-# ---- Helpers
+# ---------- NLTK bootstrap ----------
 @st.cache_resource
 def ensure_nltk():
     try: nltk.data.find("tokenizers/punkt")
@@ -41,6 +44,32 @@ def basic_clean(s: str, sw, punct):
     toks = [w for w in toks if w.isalpha() and w not in sw]
     return " ".join(toks)
 
+def tfidf_embed(texts: list[str], k_svd: int = 200):
+    # TF-IDF on 1–2 grams + SVD → compact numerical embedding
+    vec = TfidfVectorizer(max_features=20000, ngram_range=(1,2), min_df=2)
+    X = vec.fit_transform(texts)
+    k = min(k_svd, max(2, min(X.shape) - 1))  # safe SVD size
+    svd = TruncatedSVD(n_components=k, random_state=42)
+    Z = svd.fit_transform(X)
+    Z = normalize(Z)  # cosine-friendly
+    return Z
+
+def choose_k(emb: np.ndarray, n: int) -> int:
+    if n < 3: return 1
+    if n < 10: return 2
+    k_min, k_max = 2, min(10, max(3, n // 3))
+    best_k, best_score = 2, -1
+    for k in range(k_min, k_max + 1):
+        km = MiniBatchKMeans(n_clusters=k, random_state=42, n_init="auto", batch_size=256)
+        labels = km.fit_predict(emb)
+        if len(set(labels)) < 2: continue
+        try:
+            score = silhouette_score(emb, labels, metric="cosine")
+            if score > best_score: best_k, best_score = k, score
+        except Exception:
+            pass
+    return best_k
+
 def tfidf_keywords(texts, top_k=6):
     vec = TfidfVectorizer(max_features=6000, ngram_range=(1,2))
     X = vec.fit_transform(texts)
@@ -52,34 +81,6 @@ def pick_reps(df_cluster, k=8):
     return (df_cluster.assign(_len=df_cluster["text"].astype(str).str.len())
             .sort_values("_len")
             .head(min(k, len(df_cluster)))["text"].astype(str).tolist())
-
-def choose_k(emb, n):
-    if n < 3: return 1
-    if n < 10: return 2
-    k_min, k_max = 2, min(10, max(3, n // 3))
-    best_k, best_score = 2, -1
-    for k in range(k_min, k_max+1):
-        km = MiniBatchKMeans(n_clusters=k, random_state=42, n_init="auto", batch_size=256)
-        labels = km.fit_predict(emb)
-        if len(set(labels)) < 2: continue
-        try:
-            score = silhouette_score(emb, labels, metric="cosine")
-            if score > best_score: best_k, best_score = k, score
-        except Exception:
-            pass
-    return best_k
-
-@st.cache_resource
-def load_embedder():
-    # Small, accurate, fast CPU model
-    return TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
-
-# fastembed returns a generator of lists -> turn into a numpy array
-emb_gen = load_embedder().embed(df["text_clean"].tolist())
-emb = np.array(list(emb_gen), dtype="float32")
-
-# (optional) normalize like sentence-transformers did
-emb = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12)
 
 def gemini_label(quotes: list[str], api_key: str) -> dict:
     if not api_key: return {"label":"Theme", "bullets":[]}
@@ -116,48 +117,51 @@ def run_pipeline(df_in: pd.DataFrame, text_col: str, source_col: str|None, seg_c
     df = df[df["text_clean"].str.len() > 0].reset_index(drop=True)
     if len(df) == 0: raise ValueError("No valid rows after cleaning.")
 
-    emb = load_embedder().encode(df["text_clean"].tolist(), normalize_embeddings=True, show_progress_bar=False)
+    with st.spinner("Vectorizing (TF-IDF + SVD)…"):
+        emb = tfidf_embed(df["text_clean"].tolist(), k_svd=200)
 
-    k = choose_k(emb, len(df))
-    if k == 1:
-        df["cluster"] = 0
-    else:
-        km = MiniBatchKMeans(n_clusters=k, random_state=42, n_init="auto", batch_size=256)
-        df["cluster"] = km.fit_predict(emb)
+    with st.spinner("Clustering…"):
+        k = choose_k(emb, len(df))
+        if k == 1:
+            df["cluster"] = 0
+        else:
+            km = MiniBatchKMeans(n_clusters=k, random_state=42, n_init="auto", batch_size=256)
+            df["cluster"] = km.fit_predict(emb)
 
     summaries = []
-    for cid, g in df.groupby("cluster"):
-        quotes = pick_reps(g, k=8)
-        lab = gemini_label(quotes, api_key)
-        label = lab.get("label") or "Theme"
-        bullets = lab.get("bullets", [])
-        top_kws = tfidf_keywords(g["text_clean"].tolist(), top_k=6)
-        seg_counts = g["user_segment"].value_counts().to_dict()
-        summaries.append({
-            "cluster_id": int(cid),
-            "size": int(len(g)),
-            "label": label,
-            "bullets": bullets,
-            "top_keywords": top_kws,
-            "sample_quotes": quotes,
-            "segments": seg_counts
-        })
+    with st.spinner("Summarizing themes…"):
+        for cid, g in df.groupby("cluster"):
+            quotes = pick_reps(g, k=8)
+            lab = gemini_label(quotes, api_key=api_key)
+            label = lab.get("label") or "Theme"
+            bullets = lab.get("bullets", [])
+            top_kws = tfidf_keywords(g["text_clean"].tolist(), top_k=6)
+            seg_counts = g["user_segment"].value_counts().to_dict()
+            summaries.append({
+                "cluster_id": int(cid),
+                "size": int(len(g)),
+                "label": label,
+                "bullets": bullets,
+                "top_keywords": top_kws,
+                "sample_quotes": quotes,
+                "segments": seg_counts
+            })
 
     id2label = {s["cluster_id"]: s["label"] for s in summaries}
     df["cluster_label"] = df["cluster"].map(id2label)
     return df, summaries
 
-# ---- Sidebar: upload + mapping
+# ---------- Sidebar UI ----------
 st.sidebar.header("Upload & Configure")
-# Prefer secret; if not present, allow manual input
-gemini_key = st.secrets.get("GEMINI_API_KEY", "")
+gemini_key = st.secrets.get("GEMINI_API_KEY", "")  # prefer secret
 if not gemini_key:
     gemini_key = st.sidebar.text_input("Gemini API Key (optional)", type="password",
-                                       help="Get one at aistudio.google.com/app/apikey. Leave blank to use keyword-only labels.")
+                                       help="Get one at aistudio.google.com/app/apikey. Leave blank for keyword-only labels.")
 
 uploaded = st.sidebar.file_uploader("Upload CSV or Excel", type=["csv","xlsx","xls"])
 use_sample = st.sidebar.toggle("Use sample data", value=not bool(uploaded))
 
+# ---------- Preview ----------
 df_preview = None
 if use_sample:
     df_preview = pd.DataFrame({
@@ -212,7 +216,8 @@ if df_preview is not None:
             if search.strip(): q = q[q["text"].str.contains(search, case=False, na=False)]
 
             st.subheader("Top pain points / themes")
-            theme_counts = (q.groupby("cluster_label")["id"].count().sort_values(ascending=False).reset_index(name="count"))
+            theme_counts = (q.groupby("cluster_label")["id"].count()
+                              .sort_values(ascending=False).reset_index(name="count"))
             st.plotly_chart(px.bar(theme_counts, x="cluster_label", y="count"), use_container_width=True)
 
             st.subheader("Theme drill-down")
@@ -229,7 +234,8 @@ if df_preview is not None:
                     st.caption("Keyword-only theme (no Gemini key provided).")
 
                 seg_break = (q[q["cluster_label"] == picked]
-                             .groupby("user_segment")["id"].count().reset_index(name="count").sort_values("count", ascending=False))
+                             .groupby("user_segment")["id"].count()
+                             .reset_index(name="count").sort_values("count", ascending=False))
                 if not seg_break.empty:
                     st.plotly_chart(px.bar(seg_break, x="user_segment", y="count"), use_container_width=True)
 
