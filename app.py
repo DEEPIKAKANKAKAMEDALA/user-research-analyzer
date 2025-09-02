@@ -4,7 +4,7 @@ import pandas as pd, numpy as np, streamlit as st, plotly.express as px
 import nltk
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.metrics import silhouette_score
@@ -71,7 +71,15 @@ def choose_k(emb, n):
 
 @st.cache_resource
 def load_embedder():
-    return SentenceTransformer("all-MiniLM-L6-v2")
+    # Small, accurate, fast CPU model
+    return TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+
+# fastembed returns a generator of lists -> turn into a numpy array
+emb_gen = load_embedder().embed(df["text_clean"].tolist())
+emb = np.array(list(emb_gen), dtype="float32")
+
+# (optional) normalize like sentence-transformers did
+emb = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12)
 
 def gemini_label(quotes: list[str], api_key: str) -> dict:
     if not api_key: return {"label":"Theme", "bullets":[]}
